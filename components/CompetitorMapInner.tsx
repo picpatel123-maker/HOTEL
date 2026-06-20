@@ -143,24 +143,28 @@ out center body;`;
 
     const controller = new AbortController();
 
-    fetch('https://overpass-api.de/api/interpreter', {
+    // Call our server-side proxy — avoids CORS and CSP issues entirely.
+    // The proxy tries overpass-api.de → kumi.systems → openstreetmap.ru in order.
+    fetch('/api/overpass', {
       method:  'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body:    `data=${encodeURIComponent(query)}`,
       signal:  controller.signal,
     })
       .then(r => {
-        if (!r.ok) throw new Error(`Overpass returned ${r.status}`);
+        if (!r.ok) throw new Error(`Proxy returned ${r.status}`);
         return r.json();
       })
       .then((data: {
-        elements: Array<{
+        elements?: Array<{
           id: number;
           lat?: number; lon?: number;
           center?: { lat: number; lon: number };
           tags?: Record<string, string>;
         }>;
+        error?: string;
       }) => {
+        if (data.error) throw new Error(data.error);
         const results: NearbyHotel[] = [];
         for (const el of data.elements ?? []) {
           const elLat = el.lat ?? el.center?.lat;
@@ -172,7 +176,7 @@ out center body;`;
             lon:      elLon,
             name:     el.tags?.name ?? el.tags?.['name:en'] ?? 'Unnamed Hotel',
             brand:    el.tags?.brand ?? el.tags?.operator,
-            stars:    el.tags?.stars ?? el.tags?.['stars'],
+            stars:    el.tags?.stars,
             distance: haversine(lat, lon, elLat, elLon),
           });
         }
@@ -182,26 +186,8 @@ out center body;`;
       })
       .catch(err => {
         if (err.name === 'AbortError') return;
-        // Fallback to secondary Overpass endpoint
-        fetch('https://overpass.kumi.systems/api/interpreter', {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body:    `data=${encodeURIComponent(query)}`,
-        })
-          .then(r => r.json())
-          .then((data: { elements: Array<{ id: number; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> }) => {
-            const results: NearbyHotel[] = [];
-            for (const el of data.elements ?? []) {
-              const elLat = el.lat ?? el.center?.lat;
-              const elLon = el.lon ?? el.center?.lon;
-              if (elLat == null || elLon == null) continue;
-              results.push({ id: el.id, lat: elLat, lon: elLon, name: el.tags?.name ?? 'Unnamed Hotel', brand: el.tags?.brand, stars: el.tags?.stars, distance: haversine(lat, lon, elLat, elLon) });
-            }
-            results.sort((a, b) => a.distance - b.distance);
-            setHotels(results);
-            setStatus('done');
-          })
-          .catch(() => { setStatus('error'); setErrorMsg('Could not reach map data API. Try again.'); });
+        setStatus('error');
+        setErrorMsg('Could not load nearby hotels — check your connection and try again.');
       });
 
     return () => controller.abort();

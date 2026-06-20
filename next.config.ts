@@ -27,8 +27,8 @@ const securityHeaders = [
       // Next.js inline scripts and Recharts/Leaflet need unsafe-inline in dev; tighten for prod if needed
       "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       "style-src 'self' 'unsafe-inline'",
-      // Nominatim geocoding + Overpass API + OpenStreetMap tiles
-      "connect-src 'self' https://nominatim.openstreetmap.org https://overpass-api.de https://*.tile.openstreetmap.org",
+      // Nominatim geocoding (client-side) + OSM tiles; Overpass is proxied server-side
+      "connect-src 'self' https://nominatim.openstreetmap.org https://*.tile.openstreetmap.org",
       // OSM tile images
       "img-src 'self' data: blob: https://*.tile.openstreetmap.org https://unpkg.com",
       "font-src 'self' https://fonts.gstatic.com",
