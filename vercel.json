@@ -1,3 +1,8 @@
 {
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "functions": {
+    "app/api/overpass/route.ts": {
+      "maxDuration": 25
+    }
+  }
 }

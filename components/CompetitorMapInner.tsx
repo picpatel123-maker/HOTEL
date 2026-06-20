@@ -65,6 +65,7 @@ export default function CompetitorMapInner({ address }: { address: string }) {
   const [hotels, setHotels]       = useState<NearbyHotel[]>([]);
   const [radiusMi, setRadiusMi]   = useState(3);
   const [selected, setSelected]   = useState<NearbyHotel | null>(null);
+  const [retryKey, setRetryKey]   = useState(0);
 
   const searchAddr = address.trim() || 'Austin, TX';
   const radiusM    = radiusMi * 1609.34;
@@ -130,7 +131,7 @@ export default function CompetitorMapInner({ address }: { address: string }) {
     setStatus('fetching');
     const { lat, lon } = coords;
 
-    const query = `[out:json][timeout:25];
+    const overpassQuery = `[out:json][timeout:18];
 (
   node["tourism"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
   node["tourism"="motel"](around:${Math.round(radiusM)},${lat},${lon});
@@ -139,59 +140,91 @@ export default function CompetitorMapInner({ address }: { address: string }) {
   way["amenity"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
   relation["tourism"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
 );
-out center body;`;
+out center tags;`;
+
+    type OverpassEl = {
+      id: number; lat?: number; lon?: number;
+      center?: { lat: number; lon: number };
+      tags?: Record<string, string>;
+    };
+
+    function parseOverpass(elements: OverpassEl[]): NearbyHotel[] {
+      const results: NearbyHotel[] = [];
+      for (const el of elements) {
+        const elLat = el.lat ?? el.center?.lat;
+        const elLon = el.lon ?? el.center?.lon;
+        if (elLat == null || elLon == null) continue;
+        results.push({
+          id:       el.id,
+          lat:      elLat,
+          lon:      elLon,
+          name:     el.tags?.name ?? el.tags?.['name:en'] ?? 'Unnamed Hotel',
+          brand:    el.tags?.brand ?? el.tags?.operator,
+          stars:    el.tags?.stars,
+          distance: haversine(lat, lon, elLat, elLon),
+        });
+      }
+      return results.sort((a, b) => a.distance - b.distance);
+    }
+
+    // Fallback: Nominatim bounded hotel search (client-side, already in CSP)
+    async function nominatimFallback(): Promise<NearbyHotel[]> {
+      const deg = (radiusM / 111320) * 1.5; // slightly larger box for coverage
+      const viewbox = `${lon - deg},${lat + deg},${lon + deg},${lat - deg}`;
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=hotel&viewbox=${viewbox}&bounded=1&limit=50&accept-language=en`;
+      const r = await fetch(url, { headers: { Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`Nominatim ${r.status}`);
+      const data = await r.json() as Array<{
+        place_id: number; lat: string; lon: string; display_name: string;
+        class?: string; type?: string;
+      }>;
+      return data
+        .map(p => ({
+          id:       p.place_id,
+          lat:      parseFloat(p.lat),
+          lon:      parseFloat(p.lon),
+          name:     p.display_name.split(',')[0].trim() || 'Hotel',
+          brand:    undefined as string | undefined,
+          stars:    undefined as string | undefined,
+          distance: haversine(lat, lon, parseFloat(p.lat), parseFloat(p.lon)),
+        }))
+        .filter(h => h.distance <= radiusM / 1609.34)
+        .sort((a, b) => a.distance - b.distance);
+    }
 
     const controller = new AbortController();
 
-    // Call our server-side proxy — avoids CORS and CSP issues entirely.
-    // The proxy tries overpass-api.de → kumi.systems → openstreetmap.ru in order.
+    // Primary: server-side proxy races 3 Overpass mirrors in parallel
     fetch('/api/overpass', {
       method:  'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    `data=${encodeURIComponent(query)}`,
+      body:    `data=${encodeURIComponent(overpassQuery)}`,
       signal:  controller.signal,
     })
       .then(r => {
-        if (!r.ok) throw new Error(`Proxy returned ${r.status}`);
-        return r.json();
+        if (!r.ok) throw new Error(`proxy ${r.status}`);
+        return r.json() as Promise<{ elements?: OverpassEl[]; error?: string }>;
       })
-      .then((data: {
-        elements?: Array<{
-          id: number;
-          lat?: number; lon?: number;
-          center?: { lat: number; lon: number };
-          tags?: Record<string, string>;
-        }>;
-        error?: string;
-      }) => {
+      .then(data => {
         if (data.error) throw new Error(data.error);
-        const results: NearbyHotel[] = [];
-        for (const el of data.elements ?? []) {
-          const elLat = el.lat ?? el.center?.lat;
-          const elLon = el.lon ?? el.center?.lon;
-          if (elLat == null || elLon == null) continue;
-          results.push({
-            id:       el.id,
-            lat:      elLat,
-            lon:      elLon,
-            name:     el.tags?.name ?? el.tags?.['name:en'] ?? 'Unnamed Hotel',
-            brand:    el.tags?.brand ?? el.tags?.operator,
-            stars:    el.tags?.stars,
-            distance: haversine(lat, lon, elLat, elLon),
-          });
-        }
-        results.sort((a, b) => a.distance - b.distance);
-        setHotels(results);
+        setHotels(parseOverpass(data.elements ?? []));
         setStatus('done');
       })
-      .catch(err => {
+      .catch(async err => {
         if (err.name === 'AbortError') return;
-        setStatus('error');
-        setErrorMsg('Could not load nearby hotels — check your connection and try again.');
+        // Fallback: Nominatim hotel search (different API, better availability)
+        try {
+          const results = await nominatimFallback();
+          setHotels(results);
+          setStatus('done');
+        } catch {
+          setStatus('error');
+          setErrorMsg('Hotel data unavailable for this area — try a different radius or address.');
+        }
       });
 
     return () => controller.abort();
-  }, [coords, radiusM]);
+  }, [coords, radiusM, retryKey]);
 
   // ── 4. Update map when coords change ─────────────────────────────────────
   useEffect(() => {
@@ -293,7 +326,15 @@ out center body;`;
           {status === 'geocoding' && <span style={{ color: '#94a3b8' }}>📍 Locating address…</span>}
           {status === 'fetching'  && <span style={{ color: '#94a3b8' }}>🔍 Scanning for nearby hotels…</span>}
           {status === 'done'      && <span style={{ color: '#10b981' }}>✓ {hotels.length} hotel{hotels.length !== 1 ? 's' : ''} found within {radiusMi} mi</span>}
-          {status === 'error'     && <span style={{ color: '#ef4444' }}>⚠ {errorMsg}</span>}
+          {status === 'error'     && (
+            <span style={{ color: '#ef4444', display: 'flex', alignItems: 'center', gap: 8 }}>
+              ⚠ {errorMsg}
+              <button
+                onClick={() => { setStatus('fetching'); setRetryKey(k => k + 1); }}
+                style={{ padding: '3px 10px', fontSize: 11, background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 5, color: '#ef4444', cursor: 'pointer', fontWeight: 600 }}
+              >Retry</button>
+            </span>
+          )}
         </span>
       </div>
 
