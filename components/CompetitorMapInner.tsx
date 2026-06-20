@@ -1,7 +1,21 @@
 'use client';
 
+// Static imports — works because this file is only ever loaded client-side
+// (parent CompetitorMap.tsx wraps this in `dynamic(..., { ssr: false })`)
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import { useEffect, useRef, useState } from 'react';
-import type L from 'leaflet';
+
+// Fix the broken default icon paths that Webpack/Turbopack cause
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconUrl:       'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  shadowUrl:     'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 interface NearbyHotel {
   id: number;
@@ -10,226 +24,270 @@ interface NearbyHotel {
   name: string;
   brand?: string;
   stars?: string;
-  distance?: number;
-  type?: string;
+  distance: number;
 }
 
-interface MapProps {
-  address: string;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function getBrand(name: string, brand?: string) {
+  const t = `${name} ${brand ?? ''}`.toLowerCase();
+  if (/hampton|home2|homewood|doubletree|hilton garden|curio|tapestry|hilton/.test(t))  return { family: 'Hilton',   color: '#1D4ED8', letter: 'H' };
+  if (/courtyard|fairfield|residence inn|springhill|westin|sheraton|marriott/.test(t))  return { family: 'Marriott', color: '#9B1C1C', letter: 'M' };
+  if (/holiday inn|crowne plaza|staybridge|avid|kimpton|intercontinental|ihg/.test(t)) return { family: 'IHG',      color: '#065F46', letter: 'I' };
+  if (/hyatt place|hyatt house|hyatt regency|andaz|hyatt/.test(t))                     return { family: 'Hyatt',    color: '#1E3A5F', letter: 'Y' };
+  if (/days inn|super 8|la quinta|baymont|wingate|wyndham/.test(t))                    return { family: 'Wyndham',  color: '#6D28D9', letter: 'W' };
+  if (/comfort|quality inn|sleep inn|cambria|woodspring|econo|choice/.test(t))         return { family: 'Choice',   color: '#C2410C', letter: 'C' };
+  if (/best western/.test(t))                                                           return { family: 'BW',       color: '#1E40AF', letter: 'B' };
+  return { family: 'Other', color: '#4B5563', letter: '◆' };
 }
 
-function getBrandFamily(name: string, brand?: string): { family: string; color: string; letter: string } {
-  const text = ((name ?? '') + ' ' + (brand ?? '')).toLowerCase();
-  if (/hilton|hampton|home2|homewood|doubletree|hgi|hilton garden|curio|tapestry/.test(text))
-    return { family: 'Hilton', color: '#002B5C', letter: 'H' };
-  if (/marriott|courtyard|fairfield|residence inn|springhill|westin|sheraton|autograph/.test(text))
-    return { family: 'Marriott', color: '#8B1D2C', letter: 'M' };
-  if (/ihg|holiday inn|crowne plaza|staybridge|avid|kimpton|intercontinental/.test(text))
-    return { family: 'IHG', color: '#006241', letter: 'I' };
-  if (/hyatt|place|house|regency|andaz/.test(text))
-    return { family: 'Hyatt', color: '#003459', letter: 'Y' };
-  if (/wyndham|days inn|super 8|la quinta|baymont|wingate/.test(text))
-    return { family: 'Wyndham', color: '#2563EB', letter: 'W' };
-  if (/choice|comfort|quality|sleep inn|cambria|woodspring|econo/.test(text))
-    return { family: 'Choice', color: '#EA580C', letter: 'C' };
-  if (/best western/.test(text))
-    return { family: 'BW', color: '#1D4ED8', letter: 'B' };
-  return { family: 'Other', color: '#6B7280', letter: '★' };
-}
-
-function calcDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 3958.8;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export default function CompetitorMapInner({ address }: MapProps) {
-  const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<L.Map | null>(null);
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export default function CompetitorMapInner({ address }: { address: string }) {
+  const containerRef  = useRef<HTMLDivElement>(null);
+  const mapRef        = useRef<L.Map | null>(null);
+  const markersRef    = useRef<L.LayerGroup | null>(null);  // only markers, never the tile layer
+  const circleRef     = useRef<L.Circle | null>(null);
+  const subjectRef    = useRef<L.Marker | null>(null);
+
   const [status, setStatus] = useState<'idle' | 'geocoding' | 'fetching' | 'done' | 'error'>('idle');
-  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
-  const [hotels, setHotels] = useState<NearbyHotel[]>([]);
-  const [errorMsg, setErrorMsg] = useState('');
-  const [radiusMi, setRadiusMi] = useState(3);
-  const [selected, setSelected] = useState<NearbyHotel | null>(null);
+  const [errorMsg, setErrorMsg]   = useState('');
+  const [coords, setCoords]       = useState<{ lat: number; lon: number } | null>(null);
+  const [hotels, setHotels]       = useState<NearbyHotel[]>([]);
+  const [radiusMi, setRadiusMi]   = useState(3);
+  const [selected, setSelected]   = useState<NearbyHotel | null>(null);
 
-  const searchAddress = address.trim() || 'Austin, TX';
-  const radiusM = radiusMi * 1609.34;
+  const searchAddr = address.trim() || 'Austin, TX';
+  const radiusM    = radiusMi * 1609.34;
 
-  // Geocode address whenever it changes
+  // ── 1. Initialize map ONCE ────────────────────────────────────────────────
   useEffect(() => {
-    if (!searchAddress) return;
+    if (!containerRef.current || mapRef.current) return;
+
+    const map = L.map(containerRef.current, {
+      center:           [30.2672, -97.7431],
+      zoom:             12,
+      zoomControl:      true,
+      scrollWheelZoom:  true,
+    });
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>',
+      maxZoom: 19,
+    }).addTo(map);
+
+    markersRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+
+    return () => {
+      map.remove();
+      mapRef.current   = null;
+      markersRef.current = null;
+    };
+  }, []);
+
+  // ── 2. Geocode address (with 600 ms debounce) ─────────────────────────────
+  useEffect(() => {
     setStatus('geocoding');
     setErrorMsg('');
     setHotels([]);
+    setCoords(null);
 
-    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchAddress)}&limit=1`;
+    const timer = setTimeout(async () => {
+      try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(searchAddr)}`;
+        const res  = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        const data = await res.json() as Array<{ lat: string; lon: string }>;
 
-    fetch(url, {
-      headers: { 'Accept-Language': 'en', 'User-Agent': 'HotelValueAnalyzer/1.0' },
-    })
-      .then(r => r.json())
-      .then((data: Array<{ lat: string; lon: string }>) => {
         if (!data.length) {
           setStatus('error');
-          setErrorMsg('Address not found. Try a city + state (e.g. "Austin, TX").');
+          setErrorMsg('Address not found — try "Hampton Inn, Austin TX" or just a city.');
           return;
         }
-        const lat = parseFloat(data[0].lat);
-        const lon = parseFloat(data[0].lon);
-        setCoords({ lat, lon });
-      })
-      .catch(() => {
+        setCoords({ lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) });
+      } catch {
         setStatus('error');
-        setErrorMsg('Geocoding failed. Check your connection.');
-      });
-  }, [searchAddress]);
+        setErrorMsg('Geocoding failed — check your network connection.');
+      }
+    }, 600);
 
-  // Fetch hotels when coords or radius changes
+    return () => clearTimeout(timer);
+  }, [searchAddr]);
+
+  // ── 3. Fetch nearby hotels when coords or radius changes ──────────────────
   useEffect(() => {
     if (!coords) return;
+
     setStatus('fetching');
     const { lat, lon } = coords;
 
-    const overpassQuery = `[out:json][timeout:20];
+    const query = `[out:json][timeout:25];
 (
   node["tourism"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
   node["tourism"="motel"](around:${Math.round(radiusM)},${lat},${lon});
   node["amenity"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
   way["tourism"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
   way["amenity"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
+  relation["tourism"="hotel"](around:${Math.round(radiusM)},${lat},${lon});
 );
 out center body;`;
 
+    const controller = new AbortController();
+
     fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      body: overpassQuery,
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    `data=${encodeURIComponent(query)}`,
+      signal:  controller.signal,
     })
-      .then(r => r.json())
-      .then((data: { elements: Array<{ id: number; type: string; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> }) => {
-        const elements = data.elements ?? [];
-        const parsed: NearbyHotel[] = elements
-          .map(el => {
-            const elLat = el.lat ?? el.center?.lat;
-            const elLon = el.lon ?? el.center?.lon;
-            if (!elLat || !elLon) return null;
-            const name = el.tags?.name ?? el.tags?.['name:en'] ?? 'Unnamed Hotel';
-            const brand = el.tags?.brand ?? el.tags?.operator ?? undefined;
-            const stars = el.tags?.stars ?? el.tags?.['tourism:stars'] ?? undefined;
-            const dist = calcDistance(lat, lon, elLat, elLon);
-            return { id: el.id, lat: elLat, lon: elLon, name, brand, stars, distance: dist, type: el.tags?.tourism ?? el.tags?.amenity };
-          })
-          .filter(Boolean)
-          .sort((a, b) => (a!.distance ?? 0) - (b!.distance ?? 0)) as NearbyHotel[];
-        setHotels(parsed);
+      .then(r => {
+        if (!r.ok) throw new Error(`Overpass returned ${r.status}`);
+        return r.json();
+      })
+      .then((data: {
+        elements: Array<{
+          id: number;
+          lat?: number; lon?: number;
+          center?: { lat: number; lon: number };
+          tags?: Record<string, string>;
+        }>;
+      }) => {
+        const results: NearbyHotel[] = [];
+        for (const el of data.elements ?? []) {
+          const elLat = el.lat ?? el.center?.lat;
+          const elLon = el.lon ?? el.center?.lon;
+          if (elLat == null || elLon == null) continue;
+          results.push({
+            id:       el.id,
+            lat:      elLat,
+            lon:      elLon,
+            name:     el.tags?.name ?? el.tags?.['name:en'] ?? 'Unnamed Hotel',
+            brand:    el.tags?.brand ?? el.tags?.operator,
+            stars:    el.tags?.stars ?? el.tags?.['stars'],
+            distance: haversine(lat, lon, elLat, elLon),
+          });
+        }
+        results.sort((a, b) => a.distance - b.distance);
+        setHotels(results);
         setStatus('done');
       })
-      .catch(() => {
-        setStatus('error');
-        setErrorMsg('Failed to load nearby hotels. Try again.');
+      .catch(err => {
+        if (err.name === 'AbortError') return;
+        // Fallback to secondary Overpass endpoint
+        fetch('https://overpass.kumi.systems/api/interpreter', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:    `data=${encodeURIComponent(query)}`,
+        })
+          .then(r => r.json())
+          .then((data: { elements: Array<{ id: number; lat?: number; lon?: number; center?: { lat: number; lon: number }; tags?: Record<string, string> }> }) => {
+            const results: NearbyHotel[] = [];
+            for (const el of data.elements ?? []) {
+              const elLat = el.lat ?? el.center?.lat;
+              const elLon = el.lon ?? el.center?.lon;
+              if (elLat == null || elLon == null) continue;
+              results.push({ id: el.id, lat: elLat, lon: elLon, name: el.tags?.name ?? 'Unnamed Hotel', brand: el.tags?.brand, stars: el.tags?.stars, distance: haversine(lat, lon, elLat, elLon) });
+            }
+            results.sort((a, b) => a.distance - b.distance);
+            setHotels(results);
+            setStatus('done');
+          })
+          .catch(() => { setStatus('error'); setErrorMsg('Could not reach map data API. Try again.'); });
       });
+
+    return () => controller.abort();
   }, [coords, radiusM]);
 
-  // Initialize / update map
+  // ── 4. Update map when coords change ─────────────────────────────────────
   useEffect(() => {
-    if (!mapContainerRef.current) return;
+    if (!mapRef.current || !coords) return;
+    const map = mapRef.current;
 
-    import('leaflet').then(Leaflet => {
-      import('leaflet/dist/leaflet.css');
+    map.setView([coords.lat, coords.lon], radiusMi <= 2 ? 15 : radiusMi <= 5 ? 13 : 11, { animate: true });
 
-      const Lmap = Leaflet.default ?? Leaflet;
+    // Update / recreate radius circle
+    circleRef.current?.remove();
+    circleRef.current = L.circle([coords.lat, coords.lon], {
+      radius:      radiusM,
+      color:       '#f59e0b',
+      fillColor:   '#f59e0b',
+      fillOpacity: 0.06,
+      weight:      1.5,
+      dashArray:   '6 5',
+    }).addTo(map);
 
-      if (!mapRef.current) {
-        const center: [number, number] = coords ? [coords.lat, coords.lon] : [30.2672, -97.7431];
-        mapRef.current = Lmap.map(mapContainerRef.current!, { zoomControl: true, scrollWheelZoom: true });
-        Lmap.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-          maxZoom: 19,
-        }).addTo(mapRef.current);
-        mapRef.current.setView(center, 13);
-      }
-
-      if (!coords) return;
-
-      const map = mapRef.current;
-      map.eachLayer((layer: L.Layer) => { if ((layer as L.Marker).getLatLng) map.removeLayer(layer); });
-
-      Lmap.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-        maxZoom: 19,
-      }).addTo(map);
-
-      // Radius circle
-      Lmap.circle([coords.lat, coords.lon], {
-        radius: radiusM,
-        color: '#f59e0b',
-        fillColor: '#f59e0b',
-        fillOpacity: 0.05,
-        weight: 1.5,
-        dashArray: '6 4',
-      }).addTo(map);
-
-      // Subject property marker
-      const subjectIcon = Lmap.divIcon({
-        html: `<div style="width:40px;height:40px;border-radius:50%;background:#f59e0b;display:flex;align-items:center;justify-content:center;font-size:18px;border:3px solid white;box-shadow:0 3px 12px rgba(0,0,0,0.5)">🏨</div>`,
-        className: '',
-        iconSize: [40, 40],
-        iconAnchor: [20, 20],
-        popupAnchor: [0, -24],
-      });
-
-      Lmap.marker([coords.lat, coords.lon], { icon: subjectIcon })
-        .addTo(map)
-        .bindPopup(`<div style="font-family:sans-serif;font-size:13px"><strong style="color:#f59e0b">📍 Subject Property</strong><br/>${searchAddress}</div>`)
-        .openPopup();
-
-      // Competitor markers
-      hotels.forEach(hotel => {
-        const bf = getBrandFamily(hotel.name, hotel.brand);
-        const icon = Lmap.divIcon({
-          html: `<div style="width:30px;height:30px;border-radius:50%;background:${bf.color};display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:white;border:2px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.4)">${bf.letter}</div>`,
-          className: '',
-          iconSize: [30, 30],
-          iconAnchor: [15, 15],
-          popupAnchor: [0, -18],
-        });
-
-        const starsHtml = hotel.stars ? ` · ${'★'.repeat(Number(hotel.stars))}` : '';
-        Lmap.marker([hotel.lat, hotel.lon], { icon })
-          .addTo(map)
-          .bindPopup(`
-            <div style="font-family:sans-serif;font-size:12px;min-width:160px">
-              <strong style="font-size:13px;color:${bf.color}">${hotel.name}</strong>
-              ${starsHtml ? `<div style="color:#f59e0b">${starsHtml}</div>` : ''}
-              ${hotel.brand ? `<div style="color:#666">Brand: ${hotel.brand}</div>` : ''}
-              <div style="color:#888">Family: ${bf.family}</div>
-              <div style="color:#555;margin-top:4px">📏 ${hotel.distance?.toFixed(2)} mi away</div>
-            </div>
-          `);
-      });
-
-      map.setView([coords.lat, coords.lon], radiusMi <= 2 ? 15 : radiusMi <= 5 ? 13 : 11);
+    // Update subject marker
+    subjectRef.current?.remove();
+    const subjectIcon = L.divIcon({
+      html: `<div style="width:42px;height:42px;border-radius:50%;background:#f59e0b;display:flex;align-items:center;justify-content:center;font-size:20px;border:3px solid white;box-shadow:0 3px 14px rgba(0,0,0,0.55)">🏨</div>`,
+      className:   '',
+      iconSize:    [42, 42],
+      iconAnchor:  [21, 21],
+      popupAnchor: [0, -26],
     });
-  }, [coords, hotels, radiusM, radiusMi, searchAddress]);
+    subjectRef.current = L.marker([coords.lat, coords.lon], { icon: subjectIcon, zIndexOffset: 1000 })
+      .addTo(map)
+      .bindPopup(`<b style="color:#b45309">📍 Subject Property</b><br/><span style="font-size:12px">${searchAddr}</span>`)
+      .openPopup();
+  }, [coords, radiusM, radiusMi, searchAddr]);
 
-  // Cleanup on unmount
+  // ── 5. Redraw competitor markers when hotels list changes ─────────────────
   useEffect(() => {
-    return () => { mapRef.current?.remove(); mapRef.current = null; };
-  }, []);
+    if (!markersRef.current) return;
 
+    markersRef.current.clearLayers();
+
+    hotels.forEach(hotel => {
+      const bf = getBrand(hotel.name, hotel.brand);
+      const icon = L.divIcon({
+        html: `<div style="width:32px;height:32px;border-radius:50%;background:${bf.color};display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:white;border:2.5px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.45)">${bf.letter}</div>`,
+        className:   '',
+        iconSize:    [32, 32],
+        iconAnchor:  [16, 16],
+        popupAnchor: [0, -20],
+      });
+
+      const starsStr = hotel.stars ? '★'.repeat(Math.min(Number(hotel.stars), 5)) : '';
+      L.marker([hotel.lat, hotel.lon], { icon })
+        .addTo(markersRef.current!)
+        .bindPopup(`
+          <div style="font-family:system-ui,sans-serif;min-width:170px">
+            <div style="font-weight:700;font-size:13px;color:${bf.color};margin-bottom:3px">${hotel.name}</div>
+            ${starsStr ? `<div style="color:#b45309;font-size:12px">${starsStr}</div>` : ''}
+            ${hotel.brand ? `<div style="color:#555;font-size:12px">Brand: ${hotel.brand}</div>` : ''}
+            <div style="color:#777;font-size:11px">${bf.family}</div>
+            <div style="color:#444;font-size:11px;margin-top:4px;border-top:1px solid #eee;padding-top:4px">📏 ${hotel.distance.toFixed(2)} mi from subject</div>
+          </div>
+        `);
+    });
+  }, [hotels]);
+
+  // ── Derived data for the sidebar table ───────────────────────────────────
   const brandGroups = hotels.reduce<Record<string, number>>((acc, h) => {
-    const bf = getBrandFamily(h.name, h.brand);
-    acc[bf.family] = (acc[bf.family] ?? 0) + 1;
+    const { family } = getBrand(h.name, h.brand);
+    acc[family] = (acc[family] ?? 0) + 1;
     return acc;
   }, {});
 
+  const BRAND_COLORS: Record<string, string> = {
+    Hilton: '#1D4ED8', Marriott: '#9B1C1C', IHG: '#065F46',
+    Hyatt: '#1E3A5F', Wyndham: '#6D28D9', Choice: '#C2410C', BW: '#1E40AF', Other: '#4B5563',
+  };
+
   return (
     <div>
-      {/* Controls */}
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
-        <div style={{ fontSize: 12, color: '#64748b' }}>Search radius:</div>
+      {/* Radius controls + status */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 12, color: '#64748b', fontWeight: 600 }}>Radius:</span>
         {[1, 2, 3, 5, 10].map(r => (
           <button
             key={r}
@@ -237,92 +295,82 @@ out center body;`;
             style={{
               padding: '5px 12px',
               background: radiusMi === r ? 'rgba(245,158,11,0.15)' : '#0b1220',
-              border: `1px solid ${radiusMi === r ? '#f59e0b' : '#1e2d4a'}`,
+              border:     `1px solid ${radiusMi === r ? '#f59e0b' : '#1e2d4a'}`,
               borderRadius: 6,
-              color: radiusMi === r ? '#f59e0b' : '#64748b',
-              fontSize: 12,
-              fontWeight: 600,
-              cursor: 'pointer',
+              color:  radiusMi === r ? '#f59e0b' : '#64748b',
+              fontSize: 12, fontWeight: 600, cursor: 'pointer',
             }}
-          >
-            {r} mi
-          </button>
+          >{r} mi</button>
         ))}
-        {status === 'geocoding' && <span style={{ fontSize: 12, color: '#64748b' }}>📍 Geocoding address…</span>}
-        {status === 'fetching' && <span style={{ fontSize: 12, color: '#64748b' }}>🔍 Finding nearby hotels…</span>}
-        {status === 'done' && <span style={{ fontSize: 12, color: '#10b981' }}>✓ {hotels.length} hotels within {radiusMi} mi</span>}
-        {status === 'error' && <span style={{ fontSize: 12, color: '#ef4444' }}>⚠ {errorMsg}</span>}
+
+        <span style={{ marginLeft: 4, fontSize: 12 }}>
+          {status === 'geocoding' && <span style={{ color: '#94a3b8' }}>📍 Locating address…</span>}
+          {status === 'fetching'  && <span style={{ color: '#94a3b8' }}>🔍 Scanning for nearby hotels…</span>}
+          {status === 'done'      && <span style={{ color: '#10b981' }}>✓ {hotels.length} hotel{hotels.length !== 1 ? 's' : ''} found within {radiusMi} mi</span>}
+          {status === 'error'     && <span style={{ color: '#ef4444' }}>⚠ {errorMsg}</span>}
+        </span>
       </div>
 
-      {/* Map container */}
+      {/* Map */}
       <div
-        ref={mapContainerRef}
+        ref={containerRef}
         style={{
-          height: 420,
-          borderRadius: 10,
-          border: '1px solid #1e2d4a',
-          overflow: 'hidden',
-          background: '#0b1220',
+          height: 420, borderRadius: 10,
+          border: '1px solid #1e2d4a', overflow: 'hidden',
         }}
       />
 
-      {/* Brand summary */}
-      {hotels.length > 0 && (
-        <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 8 }}>
-          {Object.entries(brandGroups).sort((a, b) => b[1] - a[1]).map(([family, count]) => {
-            const colors: Record<string, string> = {
-              Hilton: '#002B5C', Marriott: '#8B1D2C', IHG: '#006241',
-              Hyatt: '#003459', Wyndham: '#2563EB', Choice: '#EA580C',
-              BW: '#1D4ED8', Other: '#6B7280',
-            };
-            return (
-              <div key={family} style={{
-                display: 'flex', alignItems: 'center', gap: 8,
-                padding: '6px 10px',
-                background: '#0e1629',
-                border: '1px solid #1e2d4a',
-                borderRadius: 6,
-                fontSize: 12,
-              }}>
-                <div style={{ width: 12, height: 12, borderRadius: '50%', background: colors[family] ?? '#6B7280', flexShrink: 0 }} />
-                <span style={{ color: '#94a3b8' }}>{family}</span>
-                <span style={{ color: '#f59e0b', fontWeight: 700, marginLeft: 'auto' }}>{count}</span>
-              </div>
-            );
-          })}
+      {/* Brand legend */}
+      {Object.keys(brandGroups).length > 0 && (
+        <div style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {Object.entries(brandGroups).sort((a, b) => b[1] - a[1]).map(([family, count]) => (
+            <div key={family} style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              padding: '5px 10px', borderRadius: 6,
+              background: '#0e1629', border: '1px solid #1e2d4a', fontSize: 12,
+            }}>
+              <div style={{ width: 10, height: 10, borderRadius: '50%', background: BRAND_COLORS[family] ?? '#4B5563', flexShrink: 0 }} />
+              <span style={{ color: '#94a3b8' }}>{family}</span>
+              <span style={{ color: '#f59e0b', fontWeight: 700 }}>{count}</span>
+            </div>
+          ))}
         </div>
       )}
 
-      {/* Nearby hotel list */}
+      {/* Hotel list table */}
       {hotels.length > 0 && (
-        <div style={{ marginTop: 12, maxHeight: 220, overflowY: 'auto' }}>
+        <div style={{ marginTop: 12, maxHeight: 240, overflowY: 'auto', borderRadius: 8, border: '1px solid #1e2d4a' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
             <thead>
-              <tr style={{ background: '#0b1220' }}>
-                {['Hotel', 'Brand Family', 'Stars', 'Distance'].map(h => (
-                  <th key={h} style={{ padding: '8px 10px', textAlign: 'left', color: '#64748b', fontWeight: 600, borderBottom: '1px solid #1e2d4a', textTransform: 'uppercase', fontSize: 10, letterSpacing: 0.5 }}>{h}</th>
+              <tr style={{ background: '#0b1220', position: 'sticky', top: 0 }}>
+                {['Hotel', 'Family', 'Stars', 'Distance'].map(h => (
+                  <th key={h} style={{ padding: '8px 10px', textAlign: 'left', color: '#64748b', fontWeight: 600, borderBottom: '1px solid #1e2d4a', textTransform: 'uppercase', fontSize: 10, letterSpacing: 0.5, whiteSpace: 'nowrap' }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {hotels.slice(0, 30).map((hotel, i) => {
-                const bf = getBrandFamily(hotel.name, hotel.brand);
+              {hotels.slice(0, 40).map((hotel, i) => {
+                const bf = getBrand(hotel.name, hotel.brand);
+                const isSelected = selected?.id === hotel.id;
                 return (
                   <tr
                     key={hotel.id}
-                    onClick={() => setSelected(hotel === selected ? null : hotel)}
+                    onClick={() => setSelected(isSelected ? null : hotel)}
                     style={{
                       borderBottom: '1px solid #1e2d4a',
                       cursor: 'pointer',
-                      background: selected?.id === hotel.id ? 'rgba(245,158,11,0.08)' : i % 2 === 0 ? 'rgba(0,0,0,0.1)' : undefined,
+                      background: isSelected ? 'rgba(245,158,11,0.08)' : i % 2 === 0 ? 'rgba(0,0,0,0.12)' : undefined,
+                      transition: 'background 0.1s',
                     }}
                   >
                     <td style={{ padding: '7px 10px', color: '#e2e8f0', fontWeight: 500 }}>{hotel.name}</td>
                     <td style={{ padding: '7px 10px' }}>
-                      <span style={{ color: bf.color, background: `${bf.color}22`, padding: '2px 7px', borderRadius: 4, fontWeight: 600, fontSize: 11 }}>{bf.family}</span>
+                      <span style={{ color: bf.color, background: `${bf.color}20`, padding: '2px 7px', borderRadius: 4, fontWeight: 600, fontSize: 11 }}>{bf.family}</span>
                     </td>
-                    <td style={{ padding: '7px 10px', color: '#f59e0b' }}>{hotel.stars ? '★'.repeat(Number(hotel.stars)) : '—'}</td>
-                    <td style={{ padding: '7px 10px', color: '#94a3b8' }}>{hotel.distance?.toFixed(2)} mi</td>
+                    <td style={{ padding: '7px 10px', color: '#f59e0b' }}>
+                      {hotel.stars ? '★'.repeat(Math.min(Number(hotel.stars), 5)) : '—'}
+                    </td>
+                    <td style={{ padding: '7px 10px', color: '#94a3b8', whiteSpace: 'nowrap' }}>{hotel.distance.toFixed(2)} mi</td>
                   </tr>
                 );
               })}
