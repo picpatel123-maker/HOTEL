@@ -264,8 +264,8 @@ export function HotelAnalyzer() {
           </div>
           <div style={{ textAlign: 'center' }}>
             <div style={{ fontSize: 11, color: '#64748b' }}>IRR (10yr)</div>
-            <div style={{ fontSize: 15, fontWeight: 700, color: results.irr10yr >= 0.15 ? '#10b981' : results.irr10yr >= 0.10 ? '#f59e0b' : '#ef4444' }}>
-              {fmt.pct(results.irr10yr)}
+            <div style={{ fontSize: 15, fontWeight: 700, color: isNaN(results.irr10yr) ? '#ef4444' : results.irr10yr >= 0.15 ? '#10b981' : results.irr10yr >= 0.10 ? '#f59e0b' : '#ef4444' }}>
+              {isNaN(results.irr10yr) ? 'N/M' : fmt.pct(results.irr10yr)}
             </div>
           </div>
           <div style={{ textAlign: 'center' }}>
@@ -586,7 +586,7 @@ export function HotelAnalyzer() {
               <SliderRow
                 label="Rooms Dept Expense"
                 value={state.roomsExpensePct * 100}
-                min={15} max={45} step={0.5}
+                min={15} max={65} step={0.5}
                 display={`${(state.roomsExpensePct * 100).toFixed(1)}% (${fmt.currency(results.roomsExpense, true)})`}
                 onChange={v => set('roomsExpensePct')(v / 100)}
                 hint="Wages, laundry, guest supplies, OTA commissions"
@@ -594,7 +594,7 @@ export function HotelAnalyzer() {
               <SliderRow
                 label="Undistributed Expenses"
                 value={state.undistributedExpensePct * 100}
-                min={15} max={45} step={0.5}
+                min={15} max={60} step={0.5}
                 display={`${(state.undistributedExpensePct * 100).toFixed(1)}% (${fmt.currency(results.undistributedExpense, true)})`}
                 onChange={v => set('undistributedExpensePct')(v / 100)}
                 hint="A&G, Sales & Marketing, Maintenance, Utilities"
@@ -602,7 +602,7 @@ export function HotelAnalyzer() {
               <SliderRow
                 label="Management Fee"
                 value={state.managementFeePct * 100}
-                min={2} max={6} step={0.25}
+                min={2} max={12} step={0.25}
                 display={`${(state.managementFeePct * 100).toFixed(2)}% (${fmt.currency(results.managementFee, true)})`}
                 onChange={v => set('managementFeePct')(v / 100)}
                 hint="Third-party operator base fee"
@@ -610,7 +610,7 @@ export function HotelAnalyzer() {
               <SliderRow
                 label="FF&E Reserve"
                 value={state.ffeReservePct * 100}
-                min={2} max={7} step={0.25}
+                min={2} max={10} step={0.25}
                 display={`${(state.ffeReservePct * 100).toFixed(2)}% (${fmt.currency(results.ffeReserve, true)})`}
                 onChange={v => set('ffeReservePct')(v / 100)}
                 hint="Critical — omitting this inflates NOI by 3-5%"

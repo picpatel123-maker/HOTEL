@@ -32,15 +32,14 @@ function npv(rate: number, cashFlows: number[]): number {
   return cashFlows.reduce((sum, cf, t) => sum + cf / Math.pow(1 + rate, t), 0);
 }
 
-// IRR via Newton-Raphson
+// IRR via Newton-Raphson — returns NaN when no real solution exists
 function irr(cashFlows: number[]): number {
-  // Check feasibility: need at least one negative and one positive
   const hasNeg = cashFlows.some(c => c < 0);
   const hasPos = cashFlows.some(c => c > 0);
-  if (!hasNeg || !hasPos) return 0;
+  if (!hasNeg || !hasPos) return NaN;
 
   let rate = 0.10;
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 300; i++) {
     let f = 0;
     let df = 0;
     for (let t = 0; t < cashFlows.length; t++) {
@@ -48,13 +47,16 @@ function irr(cashFlows: number[]): number {
       f += cashFlows[t] / v;
       if (t > 0) df -= t * cashFlows[t] / (v * (1 + rate));
     }
-    if (df === 0) break;
+    if (df === 0 || !isFinite(df)) break;
     const r1 = rate - f / df;
+    if (!isFinite(r1)) break;
     if (Math.abs(r1 - rate) < 1e-9) return r1;
     rate = r1;
-    if (rate < -0.999) rate = 0.01;
+    // Reset if diverging; don't let it blow past -100%
+    if (rate < -0.99) rate = -0.5;
+    if (rate > 10) rate = 1;
   }
-  return rate;
+  return NaN;
 }
 
 export function calculate(s: AnalyzerState): CalculationResults {
@@ -275,6 +277,13 @@ export function calculate(s: AnalyzerState): CalculationResults {
   // ── IRR Calculations ───────────────────────────────────────────────────────
   const initialOutflow = -(totalEquityRequired);
 
+  function exitSalePrice(noi: number, propertyValue: number): number {
+    const exitCap = capRate + s.exitCapRateDelta / 100;
+    // Floor at 0: negative NOI doesn't mean negative property value (land/building still worth something)
+    const incomeVal = exitCap > 0 ? Math.max(0, noi) / exitCap : propertyValue;
+    return Math.max(0, incomeVal);
+  }
+
   function irrForPeriod(years: number): number {
     const cfs = [initialOutflow];
     for (let y = 1; y <= years; y++) {
@@ -282,9 +291,7 @@ export function calculate(s: AnalyzerState): CalculationResults {
       if (y < years) {
         cfs.push(proj.cashFlow);
       } else {
-        // Exit year: operating cash flow + net sale proceeds
-        const exitCap = capRate + s.exitCapRateDelta / 100;
-        const salePrice = exitCap > 0 ? proj.noi / exitCap : proj.propertyValue;
+        const salePrice = exitSalePrice(proj.noi, proj.propertyValue);
         const sellingCosts = salePrice * 0.03;
         const netProceeds = salePrice - sellingCosts - proj.loanBalance;
         cfs.push(proj.cashFlow + netProceeds);
@@ -294,21 +301,20 @@ export function calculate(s: AnalyzerState): CalculationResults {
   }
 
   function equityMultipleForPeriod(years: number): number {
-    const cfs = [Math.abs(initialOutflow)];
+    const invested = Math.abs(initialOutflow);
+    if (invested === 0) return 0;
+    let totalInflows = 0;
     for (let y = 1; y <= years; y++) {
       const proj = projections[y - 1];
       if (y < years) {
-        cfs.push(proj.cashFlow > 0 ? proj.cashFlow : 0);
+        totalInflows += Math.max(0, proj.cashFlow);
       } else {
-        const exitCap = capRate + s.exitCapRateDelta / 100;
-        const salePrice = exitCap > 0 ? proj.noi / exitCap : proj.propertyValue;
-        const sellingCosts = salePrice * 0.03;
-        const netProceeds = salePrice - sellingCosts - proj.loanBalance;
-        cfs.push((proj.cashFlow > 0 ? proj.cashFlow : 0) + netProceeds);
+        const salePrice = exitSalePrice(proj.noi, proj.propertyValue);
+        const netProceeds = salePrice - salePrice * 0.03 - proj.loanBalance;
+        totalInflows += Math.max(0, proj.cashFlow) + netProceeds;
       }
     }
-    const totalDist = cfs.slice(1).reduce((a, b) => a + b, 0);
-    return totalDist / cfs[0];
+    return Math.max(0, totalInflows) / invested;
   }
 
   const irr5yr = irrForPeriod(5);

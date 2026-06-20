@@ -220,6 +220,15 @@ function ValuationGauge({ results, purchasePrice }: { results: CalculationResult
   );
 }
 
+function fmtIRR(v: number): string {
+  return isNaN(v) || !isFinite(v) ? 'N/M' : fmt.pct(v);
+}
+
+function irrColor(v: number): 'good' | 'warn' | 'bad' {
+  if (isNaN(v) || !isFinite(v)) return 'bad';
+  return v >= 0.15 ? 'good' : v >= 0.10 ? 'warn' : 'bad';
+}
+
 export function ResultsDashboard({ results, state }: { results: CalculationResults; state: AnalyzerState }) {
   const brand = FRANCHISE_BRANDS[state.franchise];
 
@@ -246,17 +255,17 @@ export function ResultsDashboard({ results, state }: { results: CalculationResul
           />
           <MetricCard
             label="IRR (5-Year)"
-            value={fmt.pct(results.irr5yr)}
-            sub={`${fmt.multiple(results.equityMultiple5yr)} equity multiple`}
-            color={results.irr5yr >= 0.15 ? 'good' : results.irr5yr >= 0.10 ? 'warn' : 'bad'}
+            value={fmtIRR(results.irr5yr)}
+            sub={isNaN(results.irr5yr) ? 'Losses exceed exit value' : `${fmt.multiple(results.equityMultiple5yr)} equity multiple`}
+            color={irrColor(results.irr5yr)}
             benchmark="Good: >15% | Fair: 10-15% | Weak: <10%"
             large
           />
           <MetricCard
             label="IRR (10-Year)"
-            value={fmt.pct(results.irr10yr)}
-            sub={`${fmt.multiple(results.equityMultiple10yr)} equity multiple`}
-            color={results.irr10yr >= 0.15 ? 'good' : results.irr10yr >= 0.10 ? 'warn' : 'bad'}
+            value={fmtIRR(results.irr10yr)}
+            sub={isNaN(results.irr10yr) ? 'Losses exceed exit value' : `${fmt.multiple(results.equityMultiple10yr)} equity multiple`}
+            color={irrColor(results.irr10yr)}
             benchmark="Good: >15% | Fair: 10-15% | Weak: <10%"
             large
           />
